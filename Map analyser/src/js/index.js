@@ -9,6 +9,9 @@ const songNameEl = document.getElementById('songName')
 const songAuthorEl = document.getElementById('songAuthor')
 const chartMapperEl = document.getElementById('chartMapper')
 const starRatingBadge = document.getElementById('starRatingBadge')
+const ppValue = document.getElementById("ppValue")
+const playButton = document.getElementById("playButton")
+const songAudio = document.getElementById("songAudio")
 
 // Inputs
 const perfectInput = document.getElementById('perfect')
@@ -123,7 +126,7 @@ function createDifficultyButtons(difficulties) {
             btn.classList.remove("bg-white/10")
             btn.classList.add("bg-green-500")
             selectedDifficulty = diff
-            updateResults()
+            updateResults(currentMod)
             updateStarRating(currentMod)
         }
 
@@ -199,111 +202,119 @@ function calculateAccuracy() {
     return { accuracy, misses: nmiss }
 }
 
-function calculatePP() {
-    const diffData = getParsedDifficultyData()
-    if (!diffData?.notes) return 0
-
-    const { accuracy } = calculateAccuracy()
-    
-    // Get base OD
-    let od = diffData.overallDifficulty || 5
-    
-    // Build notes array with start times
-    const notes = []
-    for (const note of diffData.notes) {
-        if (note.type === "tap") {
-            notes.push({ startTime: note.time, key: note.key })
-        } else if (note.type === "hold") {
-            notes.push({ startTime: note.startTime, key: note.key })
-            notes.push({ startTime: note.endTime, key: note.key })
-        }
+function calculatePP(scoreData) {
+    let convertedNotes = [];
+    for (const note of scoreData.notes)
+    {
+      if (note.type == "hold")
+      {
+        let convertedNote = 
+        { 
+          startTime: note.startTime / 1000,
+          endTime: note.endTime / 1000,
+          type: note.type,
+          key: note.key,
+        };
+        convertedNotes.push(convertedNote);
+      }
+      if (note.type == "tap")
+      {
+        let convertedNote = 
+        { 
+          time: note.time / 1000,
+          startTime: note.time / 1000,
+          type: note.type,
+          key: note.key,
+        };
+        convertedNotes.push(convertedNote);
+      }
+      
     }
 
-    if (notes.length === 0) return 0
-
-    // Apply mod speed multipliers to note times FIRST
-    let modifiedNotes = [...notes]
-    let modifiedOD = od
-    
-    if (currentMod === 'nc') {
-        modifiedNotes = notes.map(n => ({ ...n, startTime: n.startTime / 1.5 }))
-        modifiedOD = Math.min(10, od * 1.4)
-    } else if (currentMod === 'ht') {
-        modifiedNotes = notes.map(n => ({ ...n, startTime: n.startTime / 0.75 }))
-        modifiedOD = Math.max(0, od * 0.5)
+    const notes = convertedNotes;
+    const od = scoreData.overallDifficulty;
+    const acc = scoreData.accuracy / 100;
+  
+    const MIN_DT = 0.04;
+    const ALPHA = 0.85;
+    const HALF_LIFE = 0.25;
+    const TAIL_FRAC = 0.10;
+    const PP_PER_UNIT = 10;
+    const OD_SLOPE = 0.08;
+    const MAX_LEN_NOTES = 500;
+    const MAX_LEN_BONUS = 1.25;
+  
+    const chordBonus = k =>
+      1 + 1.6 * (1 - Math.exp(-0.6 * Math.max(0, k - 1)));
+  
+    const reusePenalty = d =>
+      0.55 * Math.exp(-0.7 * (d - 1));
+  
+    /* build events */
+  
+    const byTime = {};
+    for (const n of notes) {
+      (byTime[n.startTime] ??= []).push(n.key);
     }
-
-    const MIN_DT = 0.04
-    const ALPHA = 0.85
-    const HALF_LIFE = 0.25
-    const TAIL_FRAC = 0.10
-    const PP_PER_UNIT = 10
-    const OD_SLOPE = 0.08
-    const MAX_LEN_NOTES = 500
-    const MAX_LEN_BONUS = 1.25
-
-    const chordBonus = k => 1 + 1.6 * (1 - Math.exp(-0.6 * Math.max(0, k - 1)))
-    const reusePenalty = d => 0.55 * Math.exp(-0.7 * (d - 1))
-
-    // Build events from modified notes
-    const byTime = {}
-    for (const n of modifiedNotes) {
-        (byTime[n.startTime] ??= []).push(n.key)
-    }
-
-    const times = Object.keys(byTime).map(Number).sort((a, b) => a - b)
+  
+    const times = Object.keys(byTime).map(Number).sort((a, b) => a - b);
+  
     const events = times.map(t => {
-        const keys = [...new Set(byTime[t])]
-        return { t, keys }
-    })
-
-    if (events.length === 0) return 0
-
-    // Calculate strain with EMA
-    let ema = 0
-    let lastT = times[0]
-    const emaVals = []
-    const history = []
-
+      const keys = [...new Set(byTime[t])];
+      return { t, keys };
+    });
+  
+    /* strain, EMA */
+  
+    let ema = 0;
+    let lastT = times[0];
+    const emaVals = [];
+    const history = [];
+  
     for (const e of events) {
-        const dt = Math.max(MIN_DT, (e.t - lastT) / 1000) // Convert ms to seconds
-        let strain = Math.pow(1 / dt, ALPHA)
-
-        let reuse = 0
-        for (let d = 1; d <= history.length; d++) {
-            if (e.keys.some(k => history[history.length - d].has(k))) {
-                reuse += reusePenalty(d)
-            }
+      const dt = Math.max(MIN_DT, e.t - lastT);
+      let strain = Math.pow(1 / dt, ALPHA);
+  
+      let reuse = 0;
+      for (let d = 1; d <= history.length; d++) {
+        if (e.keys.some(k => history[history.length - d].has(k))) {
+          reuse += reusePenalty(d);
         }
-
-        strain *= Math.max(0.2, 1 - reuse)
-        strain *= chordBonus(e.keys.length)
-
-        const decay = Math.pow(0.5, dt / HALF_LIFE)
-        ema = ema * decay + strain * (1 - decay)
-        emaVals.push(ema)
-
-        history.push(new Set(e.keys))
-        if (history.length > 6) history.shift()
-
-        lastT = e.t
+      }
+  
+      strain *= Math.max(0.2, 1 - reuse);
+      strain *= chordBonus(e.keys.length);
+  
+      const decay = Math.pow(0.5, dt / HALF_LIFE);
+      ema = ema * decay + strain * (1 - decay);
+      emaVals.push(ema);
+  
+      history.push(new Set(e.keys));
+      if (history.length > 6) history.shift();
+  
+      lastT = e.t;
     }
-
-    // Aggregate difficulty
-    emaVals.sort((a, b) => b - a)
-    const take = Math.max(1, Math.floor(emaVals.length * TAIL_FRAC))
-    const core = emaVals.slice(0, take).reduce((s, v) => s + v, 0) / take
-
-    // Final scaling - use ORIGINAL note count, not modified
-    const x = Math.min(notes.length, MAX_LEN_NOTES)
-    const lenBonus = 1 + (MAX_LEN_BONUS - 1) * Math.log(1 + x) / Math.log(1 + MAX_LEN_NOTES)
-
-    const odBonus = 1 + OD_SLOPE * (modifiedOD - 5)
-    const accBonus = Math.pow(accuracy / 100, 5)
-
-    const pp = core * lenBonus * PP_PER_UNIT * odBonus * accBonus
-
-    return Math.round(pp * 100) / 100
+  
+    /* aggregate difficulty */
+  
+    emaVals.sort((a, b) => b - a);
+    const take = Math.max(1, Math.floor(emaVals.length * TAIL_FRAC));
+    const core =
+      emaVals.slice(0, take).reduce((s, v) => s + v, 0) / take;
+  
+    /* final scaling */
+  
+    const x = Math.min(notes.length, MAX_LEN_NOTES);
+    const lenBonus =
+      1 +
+      (MAX_LEN_BONUS - 1) *
+        Math.log(1 + x) /
+        Math.log(1 + MAX_LEN_NOTES);
+  
+    const odBonus = 1 + OD_SLOPE * (od - 5);
+    const accBonus = Math.pow(acc, 5); 
+  
+    return core * lenBonus * PP_PER_UNIT * odBonus * accBonus;
 }
 
 
@@ -325,15 +336,33 @@ function calculateMaxScore() {
     return { maxScore: Math.round(maxScore) }
 }
 
-function updateResults() {
+function updateResults(mod = 'none') {
     if (!mapData) return
 
     const { accuracy } = calculateAccuracy()
     const { maxScore } = calculateMaxScore()
 
-    const pp = calculatePP()
-
-    console.log(pp)
+    const diffData = getParsedDifficultyData()
+    
+    if (mod === 'nc') {
+        diffData.notes.forEach(note => {
+            if (note.time !== undefined) note.time /= 1.5;
+            if (note.startTime !== undefined) note.startTime /= 1.5;
+            if (note.endTime !== undefined) note.endTime /= 1.5;
+        });
+    } else if (mod === 'ht') {
+        diffData.notes.forEach(note => {
+            if (note.time !== undefined) note.time /= 0.75;
+            if (note.startTime !== undefined) note.startTime /= 0.75;
+            if (note.endTime !== undefined) note.endTime /= 0.75;
+        });
+    }
+    
+    console.log(diffData)
+    diffData.accuracy = accuracy;
+    const pp = calculatePP(diffData)
+    console.log("PP: " + pp)
+    ppValue.textContent = Math.round(pp)
 }
 
 function setBackground(meta, files) {
@@ -372,6 +401,121 @@ function getStarColor(stars) {
     return '#000000'
 }
 
+function calculateStars(scoreData) {
+    let convertedNotes = [];
+    for (const note of scoreData.notes)
+    {
+      if (note.type == "hold")
+      {
+        let convertedNote = 
+        { 
+          startTime: note.startTime / 1000,
+          endTime: note.endTime / 1000,
+          type: note.type,
+          key: note.key,
+        };
+        convertedNotes.push(convertedNote);
+      }
+      if (note.type == "tap")
+      {
+        let convertedNote = 
+        { 
+          time: note.time / 1000,
+          startTime: note.time / 1000,
+          type: note.type,
+          key: note.key,
+        };
+        convertedNotes.push(convertedNote);
+      }
+      
+    }
+
+    const notes = convertedNotes;
+    const od = scoreData.overallDifficulty;
+  
+    const MIN_DT = 0.04;
+    const ALPHA = 0.85;
+    const HALF_LIFE = 0.25;
+    const TAIL_FRAC = 0.10;
+    const STAR_SCALE = 1.0;
+    const OD_SLOPE = 0.08;
+    const MAX_LEN_NOTES = 500;
+    const MAX_LEN_BONUS = 1.25;
+  
+    const chordBonus = k =>
+      1 + 1.6 * (1 - Math.exp(-0.6 * Math.max(0, k - 1)));
+  
+    const reusePenalty = d =>
+      0.55 * Math.exp(-0.7 * (d - 1));
+  
+    /* build events */
+  
+    const byTime = {};
+    for (const n of notes) {
+      (byTime[n.startTime] ??= []).push(n.key);
+  
+      if (n.type === 'hold' && n.endTime != null && n.endTime > n.startTime) {
+        (byTime[n.endTime] ??= []).push(n.key);
+      }
+    }
+  
+    const times = Object.keys(byTime).map(Number).sort((a, b) => a - b);
+  
+    const events = times.map(t => ({
+      t,
+      keys: [...new Set(byTime[t])]
+    }));
+  
+    /* strain, EMA */
+  
+    let ema = 0;
+    let lastT = times[0];
+    const emaVals = [];
+    const history = [];
+  
+    for (const e of events) {
+      const dt = Math.max(MIN_DT, e.t - lastT);
+      let strain = Math.pow(1 / dt, ALPHA);
+  
+      let reuse = 0;
+      for (let d = 1; d <= history.length; d++) {
+        if (e.keys.some(k => history[history.length - d].has(k))) {
+          reuse += reusePenalty(d);
+        }
+      }
+  
+      strain *= Math.max(0.2, 1 - reuse);
+      strain *= chordBonus(e.keys.length);
+  
+      const decay = Math.pow(0.5, dt / HALF_LIFE);
+      ema = ema * decay + strain * (1 - decay);
+      emaVals.push(ema);
+  
+      history.push(new Set(e.keys));
+      if (history.length > 6) history.shift();
+  
+      lastT = e.t;
+    }
+  
+    /* aggregate difficulty */
+    emaVals.sort((a, b) => b - a);
+    const take = Math.max(1, Math.floor(emaVals.length * TAIL_FRAC));
+    const core =
+      emaVals.slice(0, take).reduce((s, v) => s + v, 0) / take;
+  
+    /* final scaling */
+  
+    const x = Math.min(events.length, MAX_LEN_NOTES);
+    const lenBonus =
+      1 +
+      (MAX_LEN_BONUS - 1) *
+        Math.log(1 + x) /
+        Math.log(1 + MAX_LEN_NOTES);
+  
+    const odBonus = 1 + OD_SLOPE * (od - 5);
+    return core * lenBonus * odBonus * STAR_SCALE;
+}
+
 function updateStarRating(mod = 'none') {
     if (!selectedDifficulty) return
 
@@ -386,13 +530,22 @@ function updateStarRating(mod = 'none') {
         return
     }
 
-    let stars = diffData.starRating ?? 0
-
-    if (mod === 'nc') stars = diffData.starRatingNC ?? stars
-    if (mod === 'ht') stars = diffData.starRatingHT ?? stars
-
-    stars = Math.round((stars + Number.EPSILON) * 100) / 100
+    if (mod === 'nc') {
+        diffData.notes.forEach(note => {
+            if (note.time !== undefined) note.time /= 1.5;
+            if (note.startTime !== undefined) note.startTime /= 1.5;
+            if (note.endTime !== undefined) note.endTime /= 1.5;
+        });
+    } else if (mod === 'ht') {
+        diffData.notes.forEach(note => {
+            if (note.time !== undefined) note.time /= 0.75;
+            if (note.startTime !== undefined) note.startTime /= 0.75;
+            if (note.endTime !== undefined) note.endTime /= 0.75;
+        });
+    }
     
+    let stars = calculateStars(diffData)
+
     starRatingBadge.textContent = '★ ' + stars.toFixed(2)
     const bgColor = getStarColor(stars)
     const textColor = stars >= 9 ? '#FBBF24' : '#FFFFFF'
@@ -434,8 +587,31 @@ function setMod(mod) {
         modHTBtn.classList.add('bg-orange-500')
     }
 
-    updateResults()
+    updateResults(mod)
     updateStarRating(mod)
+}
+
+function playAudio() {
+    if (!mapData || !mapData.files) return
+
+    const audioFile = mapData.files.find(f => f.name.toLowerCase().startsWith('audio') && f.type === 'binary')
+    if (!audioFile) {
+        alert("No audio file found")
+        return
+    }
+
+    if (songAudio.paused) {
+        const audioBlob = new Blob([audioFile.content], { type: 'audio/*' })
+        const audioUrl = URL.createObjectURL(audioBlob)
+        songAudio.src = audioUrl
+        songAudio.play()
+        document.getElementById('playIcon').classList.add('hidden')
+        document.getElementById('pauseIcon').classList.remove('hidden')
+    } else {
+        songAudio.pause()
+        document.getElementById('playIcon').classList.remove('hidden')
+        document.getElementById('pauseIcon').classList.add('hidden')
+    }
 }
 
 modNoneBtn.addEventListener('click', () => setMod('none'))
@@ -447,3 +623,10 @@ goodInput.addEventListener('input', updateResults)
 okInput.addEventListener('input', updateResults)
 missInput.addEventListener('input', updateResults)
 comboInput.addEventListener('input', updateResults)
+
+playButton.addEventListener('click', playAudio)
+
+songAudio.addEventListener('ended', () => {
+    document.getElementById('playIcon').classList.remove('hidden')
+    document.getElementById('pauseIcon').classList.add('hidden')
+})
